@@ -105,6 +105,12 @@ class SpeculativeConfig:
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """The degree of the tensor parallelism for the draft model. Can only be 1
     or the same as the target model's tensor parallel size."""
+    draft_pipeline_parallel_size: int | None = Field(default=None, ge=1)
+    """The degree of pipeline parallelism for the draft model. Can only be 1
+    or the same as the target model's pipeline parallel size. Defaults to 1
+    for draft architectures that don't implement `SupportsPP` (most MTP/EAGLE
+    style drafters, which are fully replicated on a single PP stage — see
+    gpu_model_runner.py), and to the target's pipeline_parallel_size otherwise."""
     tensor_parallel_size: int | None = None
     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
     warn users when they mistakenly provide the wrong argument."""
@@ -1127,6 +1133,13 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config,
                     )
                 )
+                self.draft_pipeline_parallel_size = (
+                    SpeculativeConfig._verify_and_get_draft_pp(
+                        self.target_parallel_config,
+                        self.draft_pipeline_parallel_size,
+                        self.draft_model_config,
+                    )
+                )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,
@@ -1137,7 +1150,9 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        self.draft_pipeline_parallel_size,
                     )
                 )
 
@@ -1296,6 +1311,43 @@ class SpeculativeConfig:
             )
         return speculative_draft_tensor_parallel_size
 
+    @staticmethod
+    def _verify_and_get_draft_pp(
+        target_parallel_config: ParallelConfig,
+        speculative_draft_pipeline_parallel_size: int | None,
+        draft_model_config: ModelConfig,
+    ) -> int:
+        """
+        Verifies and adjusts the pipeline parallel size for a draft model.
+
+        Most draft models (MTP heads, EAGLE-style drafters) are small enough
+        to be fully replicated on a single PP stage rather than sharded across
+        the target's PP stages -- vLLM instantiates them only on the last PP
+        rank (see gpu_model_runner.py). Draft architectures that implement
+        SupportsPP may instead be split across the same PP stages as the
+        target, matching prior behavior.
+        """
+        supports_pp = draft_model_config.registry.is_pp_supported_model(
+            draft_model_config.architectures, draft_model_config
+        )
+        if speculative_draft_pipeline_parallel_size is None:
+            return target_parallel_config.pipeline_parallel_size if supports_pp else 1
+        if speculative_draft_pipeline_parallel_size not in (
+            1,
+            target_parallel_config.pipeline_parallel_size,
+        ):
+            raise ValueError(
+                f"{speculative_draft_pipeline_parallel_size=} cannot be "
+                f"other value than 1 or target model pipeline_parallel_size"
+            )
+        if speculative_draft_pipeline_parallel_size > 1 and not supports_pp:
+            raise NotImplementedError(
+                "Pipeline parallelism is not supported for the draft model "
+                "architecture. Set draft_pipeline_parallel_size=1 (the "
+                "default) or omit it."
+            )
+        return speculative_draft_pipeline_parallel_size
+
     def update_arch_(self):
         """
         EagleConfig and ExtractHiddenStatesConfig update architectures, so update all
@@ -1318,13 +1370,14 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        speculative_draft_pipeline_parallel_size: int,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=speculative_draft_pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
